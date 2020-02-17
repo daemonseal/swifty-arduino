@@ -7,6 +7,11 @@
 #include "SoftwareSerial.h"
 #define WORK_MODE LoRaWAN //  LoRaWAN or LoRaP2P
 #define JOIN_MODE OTAA    //  OTAA or ABP
+#define APP_PORT        1
+#define SEND_EVERY      60000   // Send message very 50 seconds
+#define REQUIRE_ACK     1       // Require ACK
+#define RETRIES         3       // Number of retries if message fails
+#define RETRY_AFTER     5000    // Wait these many ms before retrying
 #if JOIN_MODE == OTAA
 String DevEui = "60C5A8FFFE001010";
 String AppEui = "70B3D57ED0029873";
@@ -27,20 +32,18 @@ char buffer[] = "68656c6c6f20776f726c64"; // hello world
 #define fx "6678" // fan off
 #define ho "686f" // humidifier on
 #define hx "6878" // humidifier off
-#define cf "" // confirm
+#define cf "6366" // confirm
 
 bool InitLoRaWAN(void);
 void InitLoRaParams();
 RAK811 RAKLoRa(ATSerial, DebugSerial);
 
 void setup() {
-  pinMode(RXpin, INPUT);
-  pinMode(TXpin, OUTPUT);
+  pinMode(RELAY_GPIO, OUTPUT);
   DebugSerial.begin(115200);
   while (DebugSerial.read() >= 0) {
   }
-  while (!DebugSerial)
-    ;
+  while (!DebugSerial);
   DebugSerial.println("StartUP");
 
   ATSerial.begin(115200); // Note: Please manually set the baud rate of the
@@ -52,7 +55,7 @@ void setup() {
   DebugSerial.println(RAKLoRa.rk_getVersion()); // get RAK811 firmware version
   delay(200);
 
-  /* InitLoRaParams(); */
+  InitLoRaParams();
 }
 
 void InitLoRaParams() {
@@ -111,59 +114,65 @@ bool InitLoRaWAN(void) {
   return false;
 }
 
-void send_data(char buffer[]) {
-  if (RAKLoRa.rk_sendData(1, buffer)) {
-    for (unsigned long start = millis(); millis() - start < 90000L;) {
-      String ret = RAKLoRa.rk_recvData();
-      if (ret != NULL) {
-        ret.trim();
-        DebugSerial.println(ret);
-      }
-      if ((ret.indexOf("OK") > 0) || (ret.indexOf("ERROR") > 0)) {
-        RAKLoRa.rk_sleep(1); // Set RAK811 enter sleep mode
-        delay(10000);        // delay 10s
-        RAKLoRa.rk_sleep(0); // Wakeup RAK811 from sleep mode
-        break;
-      }
+void ttn_send() {
+
+    DebugSerial.println("Sending message");
+
+    // Send message
+    unsigned char tries = 0;
+    while (true) {
+
+        // The payload has to be an HEX string
+        char buffer[3];
+        bool state = !digitalRead(RELAY_GPIO); // relay has inverse logic
+        snprintf(buffer, sizeof(buffer), "%02X", state ? 0x31 : 0x30);
+
+        // Sending test message
+        if (RAKLoRa.rk_sendData(APP_PORT, buffer)) {
+            DebugSerial.println("Message sent correctly!");
+            return;
+        }
+
+        tries++;
+        if (tries > RETRIES) break;
+
+        DebugSerial.println("Error, trying again...");
+        delay(RETRY_AFTER);
+
     }
-  }
+
+    DebugSerial.println("Error sending message :(");
+
 }
 
-bool receive_data() {
+void ttn_receive() {
 
-  // at+recv=<status>,<port>[,<rssi>][,<snr>],<len>[,<data>]\r\n
-  // STATUS_RECV_DATA == 0
-  String r = RAKLoRa.rk_recvData();
-  if (r.length()) {
+    // at+recv=<status>,<port>[,<rssi>][,<snr>],<len>[,<data>]\r\n
+    // STATUS_RECV_DATA == 0
+    String r = RAKLoRa.rk_recvData();
+    if (r.length()) {
 
-    Serial.print("Response: ");
-    Serial.println(r);
+        DebugSerial.print("Response: ");
+        DebugSerial.println(r);
 
-    if (r.startsWith("at+recv=0,")) {
+        if (r.startsWith("at+recv=0,")) {
 
-      if (r.endsWith("666f")){
-        Serial.print("Turning fan on");
-        digitalWrite(RELAY_GPIO, HIGH);
-      }
-      else if (r.endsWith("6678")){
-        Serial.print("Turning fan off");
-        digitalWrite(RELAY_GPIO, LOW);
-      }
-      return true;
+            bool state = r.endsWith(",31");
+            DebugSerial.print("Turning relay ");
+            DebugSerial.println(state ? "ON" : "OFF");
+            digitalWrite(RELAY_GPIO, !state); // relay has inverse logic
+
+        }
+
     }
-  }
-  return false;
+
 }
 
 void loop() {
-
-  DebugSerial.println("Start send data...");
-  send_data(buffer);
-
-
-  if(receive_data()){
-    DebugSerial.println("Data received");
-    send_data(cf);
-  }
-
+    static unsigned long last = 0;
+    if ((last == 0) || (millis() - last > SEND_EVERY)) {
+        last = millis();
+        ttn_send();
+    }
+    ttn_receive();
 }
